@@ -1,0 +1,40 @@
+name: VM watchdog
+
+# Runs on GitHub's infrastructure, so it survives the two things that defeated
+# every earlier attempt: the VM going dark (the on-VM liveness script dies with
+# the patient) and Dan's Mac being asleep or offline.
+on:
+  schedule:
+    - cron: '*/5 * * * *' # GitHub's minimum; best-effort, can lag at peak
+  workflow_dispatch:
+
+concurrency:
+  group: vm-watchdog
+  cancel-in-progress: false
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write # keepalive commit — scheduled workflows are disabled
+      actions: write  # after 60 days of repo inactivity
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Probe, revive, verify
+        env:
+          VM_IP: ${{ secrets.VM_IP }}
+          VM_ID: ${{ secrets.VM_ID }}
+          VULTR: ${{ secrets.VULTR_TOKEN }}
+          TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TG_CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: bash scripts/watchdog.sh
+
+      - name: Keepalive
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash scripts/keepalive.sh
