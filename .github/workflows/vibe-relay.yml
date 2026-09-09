@@ -1,0 +1,98 @@
+name: Vibe browser reachable
+
+# The lesson from 2026-09-09, and from every other failure that week: checking
+# the component tells you nothing. The relay answers `initialize` with a healthy
+# 200 while the browser extension is detached and no browser work can happen at
+# all. Only `tools/list` reveals it — a detached extension returns
+# "Unknown remote session id" and zero tools.
+#
+# So this checks the capability, end to end, the way a real caller would.
+#
+# It runs on GitHub because the two ends it watches are the two machines that
+# keep going dark: the VM and Dan's Mac.
+on:
+  schedule:
+    - cron: '*/30 * * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: vibe-relay
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: write
+    steps:
+      - name: Can an agent actually drive the browser?
+        env:
+          URL: ${{ secrets.VIBE_MCP_URL }}
+          TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TG_CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -uo pipefail
+          if [ -z "${URL:-}" ]; then echo "VIBE_MCP_URL not set"; exit 0; fi
+
+          send() {
+            curl -s --max-time 20 -o /dev/null \
+              "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
+              --data-urlencode "chat_id=${TG_CHAT}" \
+              --data-urlencode "text=$1" --data-urlencode "parse_mode=Markdown"
+          }
+          getvar() { gh api "/repos/$REPO/actions/variables/$1" --jq .value 2>/dev/null || echo ""; }
+          setvar() {
+            gh api -X PATCH "/repos/$REPO/actions/variables/$1" -f "name=$1" -f "value=$2" >/dev/null 2>&1 ||
+              gh api -X POST "/repos/$REPO/actions/variables" -f "name=$1" -f "value=$2" >/dev/null 2>&1
+          }
+
+          probe() {
+            curl -s --max-time 25 -X POST "$URL" \
+              -H 'Content-Type: application/json' \
+              -H 'Accept: application/json, text/event-stream' \
+              -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}' 2>/dev/null
+          }
+
+          body=$(probe)
+          n=$(printf '%s' "$body" | python3 -c "
+import sys, json
+try:
+    d = json.loads(sys.stdin.read() or '{}')
+except Exception:
+    print(-1); raise SystemExit
+if d.get('error'):
+    print(0)
+else:
+    print(len((d.get('result') or {}).get('tools') or []))
+" 2>/dev/null || echo -1)
+
+          # The URL is a credential; never let it reach the log.
+          echo "tools exposed: $n"
+
+          was_down=$(getvar VIBE_DOWN)
+          if [ "${n:-0}" -gt 0 ]; then
+            echo "browser reachable"
+            [ "$was_down" = "1" ] && { setvar VIBE_DOWN 0; send "✅ *Vibe browser is reachable again* — ${n} tools exposed."; }
+            exit 0
+          fi
+
+          # Confirm once: a single failed probe during a Chrome restart is normal.
+          sleep 60
+          body=$(probe)
+          n=$(printf '%s' "$body" | python3 -c "
+import sys, json
+try:
+    d = json.loads(sys.stdin.read() or '{}')
+except Exception:
+    print(-1); raise SystemExit
+print(0 if d.get('error') else len((d.get('result') or {}).get('tools') or []))
+" 2>/dev/null || echo -1)
+          if [ "${n:-0}" -gt 0 ]; then echo "recovered on second probe"; exit 0; fi
+
+          if [ "$was_down" = "1" ]; then echo "still down, already alerted"; exit 0; fi
+          setvar VIBE_DOWN 1
+          send "🔻 *The browser agent cannot reach Chrome.* The Vibe relay answers, but the extension is detached — every browser task will fail silently. Fix: open the Vibe extension settings, toggle *Enable external AI agent control* off and on; if it stays on \"waiting\", reload the extension at chrome://extensions."
+          exit 1
