@@ -1,0 +1,46 @@
+name: Claude token expiry
+
+# The VM warns about its own token expiry too, but that check dies with the VM
+# and cannot warn about the one thing guaranteed to happen on a known date.
+# This runs on GitHub, so the reminder arrives whatever state the box is in.
+#
+# The date lives in the repo variable CLAUDE_TOKEN_EXPIRES (YYYY-MM-DD) — a
+# date, not a secret. Renewing the token means updating that variable too;
+# infra/renew-claude-token.sh does it for you.
+on:
+  schedule:
+    - cron: '0 8 * * *' # daily, 08:00 UTC
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Days until the token dies
+        env:
+          TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TG_CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
+          EXPIRES: ${{ vars.CLAUDE_TOKEN_EXPIRES }}
+        run: |
+          set -uo pipefail
+          if [ -z "${EXPIRES:-}" ]; then
+            echo "CLAUDE_TOKEN_EXPIRES not set — nothing to check"; exit 0
+          fi
+          days=$(( ( $(date -d "$EXPIRES" +%s) - $(date +%s) ) / 86400 ))
+          echo "token expires $EXPIRES — $days days away"
+
+          send() {
+            curl -s --max-time 20 -o /dev/null \
+              "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
+              --data-urlencode "chat_id=${TG_CHAT}" \
+              --data-urlencode "text=$1" --data-urlencode "parse_mode=Markdown"
+          }
+
+          # Escalating notice. Renewal needs a browser and a human, so the first
+          # warning has to arrive while it is still a calendar item rather than
+          # an outage.
+          if   [ "$days" -le 0 ];  then send "🚨 *The WhatsApp agent's Claude token expired on ${EXPIRES}.* The bot is mute until it is renewed — run \`infra/renew-claude-token.sh\`."
+          elif [ "$days" -le 3 ];  then send "🚨 *Claude token expires in ${days} day(s)* (${EXPIRES}). Renew now: \`infra/renew-claude-token.sh\` — it needs your browser, so it cannot happen automatically."
+          elif [ "$days" -le 14 ]; then send "⚠️ *Claude token expires in ${days} days* (${EXPIRES}). When it dies the bot goes silent while every health check still shows green. Renew: \`infra/renew-claude-token.sh\`"
+          elif [ "$days" -le 30 ]; then send "📅 *Heads up: the Claude token expires in ${days} days* (${EXPIRES}). Renewing takes ~2 minutes: \`infra/renew-claude-token.sh\`"
+          else echo "no alert needed"; fi
